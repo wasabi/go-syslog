@@ -5,11 +5,11 @@ package rfc5424
 
 import (
 	"fmt"
+	"github.com/wasabi/go-syslog/internal/syslogparser"
 	"math"
 	"strconv"
+	"strings"
 	"time"
-
-	"gopkg.in/mcuadros/go-syslog.v2/internal/syslogparser"
 )
 
 const (
@@ -39,6 +39,7 @@ type Parser struct {
 	header         header
 	structuredData string
 	message        string
+	isMerakiMsg    bool
 }
 
 type header struct {
@@ -89,13 +90,15 @@ func (p *Parser) Parse() error {
 
 	p.header = hdr
 
-	sd, err := p.parseStructuredData()
-	if err != nil {
-		return err
-	}
+	if !p.isMerakiMsg {
+		sd, err := p.parseStructuredData()
+		if err != nil {
+			return err
+		}
 
-	p.structuredData = sd
-	p.cursor++
+		p.structuredData = sd
+		p.cursor++
+	}
 
 	if p.cursor < p.l {
 		p.message = string(p.buff[p.cursor:])
@@ -162,22 +165,23 @@ func (p *Parser) parseHeader() (header, error) {
 	hdr.appName = appName
 	p.cursor++
 
-	procId, err := p.parseProcId()
-	if err != nil {
-		return hdr, nil
+	if !p.isMerakiMsg {
+		procId, err := p.parseProcId()
+		if err != nil {
+			return hdr, nil
+		}
+
+		hdr.procId = procId
+		p.cursor++
+
+		msgId, err := p.parseMsgId()
+		if err != nil {
+			return hdr, nil
+		}
+
+		hdr.msgId = msgId
+		p.cursor++
 	}
-
-	hdr.procId = procId
-	p.cursor++
-
-	msgId, err := p.parseMsgId()
-	if err != nil {
-		return hdr, nil
-	}
-
-	hdr.msgId = msgId
-	p.cursor++
-
 	return hdr, nil
 }
 
@@ -202,37 +206,53 @@ func (p *Parser) parseTimestamp() (time.Time, error) {
 		return ts, nil
 	}
 
-	fd, err := parseFullDate(p.buff, &p.cursor, p.l)
-	if err != nil {
-		return ts, err
+	// some sources send unix epoch nano timestamps instead of RFC5424 timestamps
+	// to check, take the next field - up to a space - and see if it is a float
+	// if it is, assume it is a unix epoch timestamp
+	tsstr := strings.Split(string(p.buff[p.cursor:]), " ")[0]
+	if strings.Contains(tsstr, "T") {
+		fd, err := parseFullDate(p.buff, &p.cursor, p.l)
+		if err != nil {
+			return ts, err
+		}
+
+		if p.cursor >= p.l || p.buff[p.cursor] != 'T' {
+			return ts, ErrInvalidTimeFormat
+		}
+
+		p.cursor++
+
+		ft, err := parseFullTime(p.buff, &p.cursor, p.l)
+		if err != nil {
+			return ts, syslogparser.ErrTimestampUnknownFormat
+		}
+
+		nSec, err := toNSec(ft.pt.secFrac)
+		if err != nil {
+			return ts, err
+		}
+
+		ts = time.Date(
+			fd.year,
+			time.Month(fd.month),
+			fd.day,
+			ft.pt.hour,
+			ft.pt.minute,
+			ft.pt.seconds,
+			nSec,
+			ft.loc,
+		)
+	} else {
+		tparts := strings.Split(tsstr, ".")
+		if len(tparts) != 2 {
+			return ts, ErrInvalidTimeFormat
+		}
+		p.isMerakiMsg = true
+		a, _ := strconv.ParseInt(tparts[0], 10, 64)
+		b, _ := strconv.ParseInt(tparts[1], 10, 64)
+		ts = time.Unix(a, b)
+		p.cursor += len(tsstr)
 	}
-
-	if p.cursor >= p.l || p.buff[p.cursor] != 'T' {
-		return ts, ErrInvalidTimeFormat
-	}
-
-	p.cursor++
-
-	ft, err := parseFullTime(p.buff, &p.cursor, p.l)
-	if err != nil {
-		return ts, syslogparser.ErrTimestampUnknownFormat
-	}
-
-	nSec, err := toNSec(ft.pt.secFrac)
-	if err != nil {
-		return ts, err
-	}
-
-	ts = time.Date(
-		fd.year,
-		time.Month(fd.month),
-		fd.day,
-		ft.pt.hour,
-		ft.pt.minute,
-		ft.pt.seconds,
-		nSec,
-		ft.loc,
-	)
 
 	return ts, nil
 }
